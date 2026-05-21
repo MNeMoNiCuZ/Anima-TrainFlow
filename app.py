@@ -431,6 +431,8 @@ def create_training_toml(project_name, config_save_dir, actual_output_dir, rank,
         "output_dir": actual_output_dir.resolve().as_posix(),
         "output_name": project_name,
         "save_every_n_steps": int(save_steps),
+        "save_state": True,
+        "save_state_on_train_end": True,
         "sample_every_n_steps": int(sample_steps),
         "sample_prompts": Path(prompt_path).resolve().as_posix(),
         "sample_sampler": "euler",
@@ -459,6 +461,36 @@ def get_latest_images(sample_dir):
     images.sort(key=os.path.getmtime, reverse=True)
     
     return [(img, Path(img).name) for img in images]
+
+def get_latest_checkpoint(project_out_dir, project_name):
+    pattern = re.compile(r"(\d+)(?!.*\d)")
+    latest_step = -1
+    latest_ckpt = None
+    for ckpt in project_out_dir.glob(f"{project_name}*.safetensors"):
+        m = pattern.search(ckpt.stem)
+        if not m:
+            continue
+        step = int(m.group(1))
+        if step > latest_step:
+            latest_step = step
+            latest_ckpt = ckpt
+    return latest_ckpt, max(0, latest_step)
+
+def get_latest_state_dir(project_out_dir, project_name):
+    pattern = re.compile(r"step(\d+)-state$")
+    latest_step = -1
+    latest_state = None
+    for state_dir in project_out_dir.glob(f"{project_name}-step*-state"):
+        if not state_dir.is_dir():
+            continue
+        m = pattern.search(state_dir.name)
+        if not m:
+            continue
+        step = int(m.group(1))
+        if step > latest_step:
+            latest_step = step
+            latest_state = state_dir
+    return latest_state, max(0, latest_step)
 
 def start_training(trigger_word, project_name, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, pos2, pos3, pos4, pos5, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc):
     global training_process
@@ -517,9 +549,25 @@ def start_training(trigger_word, project_name, dataset_path, dit_p, qwen_p, vae_
 
     log_lines = [f"🚀 Preparing: {project_name}..."]
     last_image_count = 0
-    step_pattern = re.compile(r"(\d+)/(\d+)") 
+    step_pattern = re.compile(r"(\d+)/(\d+)")
+    max_steps = int(t_steps)
+    latest_ckpt, ckpt_steps = get_latest_checkpoint(project_out_dir, project_name)
+    latest_state_dir, state_steps = get_latest_state_dir(project_out_dir, project_name)
+    completed_steps = max(ckpt_steps, state_steps)
     
     yield "\n".join(log_lines), gr.update()
+
+    if completed_steps > 0:
+        if completed_steps >= max_steps:
+            log_lines.append(f"✅ Already complete: checkpoint at step {completed_steps}, max steps is {max_steps}.")
+            yield "\n".join(log_lines), get_latest_images(sample_dir)
+            return
+        if latest_state_dir is not None and state_steps >= ckpt_steps:
+            log_lines.append(f"↪ Resuming from state step {completed_steps}: {latest_state_dir.name}")
+        elif latest_ckpt is not None:
+            log_lines.append(f"↪ Resuming from checkpoint step {completed_steps}: {latest_ckpt.name}")
+    else:
+        log_lines.append("ℹ️ No checkpoint/state found. Starting from step 0.")
 
     log_lines.append(f"🔍 Analyzing dataset images...")
     base_res, max_bucket = analyze_dataset_resolution(dataset_path)
@@ -550,8 +598,19 @@ def start_training(trigger_word, project_name, dataset_path, dit_p, qwen_p, vae_
         str(TRAIN_PYTHON), "-m", "accelerate.commands.launch", "--num_processes=1", "--mixed_precision=bf16", "--dynamo_backend=no",
         TRAIN_SCRIPT.resolve().as_posix(), 
         "--config_file", Path(training_toml).resolve().as_posix(), 
-        "--dataset_config", Path(dataset_toml).resolve().as_posix()
+        "--dataset_config", Path(dataset_toml).resolve().as_posix(),
+        "--sample_at_first",
     ]
+    if latest_state_dir is not None and completed_steps > 0 and completed_steps < max_steps:
+        cmd += [
+            "--resume", latest_state_dir.resolve().as_posix(),
+        ]
+    elif latest_ckpt is not None and completed_steps > 0 and completed_steps < max_steps:
+        cmd += [
+            "--network_weights", latest_ckpt.resolve().as_posix(),
+            "--initial_step", str(completed_steps),
+            "--skip_until_initial_step",
+        ]
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(TRAIN_DIR.resolve()) + os.pathsep + env.get("PYTHONPATH", "")
@@ -594,6 +653,13 @@ def start_training(trigger_word, project_name, dataset_path, dit_p, qwen_p, vae_
                 match = step_pattern.search(line_str)
                 if match:
                     current_step_info = match.group(0)
+                    if completed_steps > 0:
+                        current_rel = int(match.group(1))
+                        total_rel = int(match.group(2))
+                        current_abs = min(max_steps, completed_steps + current_rel)
+                        total_abs = max(completed_steps + total_rel, max_steps)
+                        current_step_info = f"{current_abs}/{total_abs}"
+                        line_str = line_str.replace(match.group(0), current_step_info, 1)
                     if (
                         0 <= last_progress_idx < len(log_lines)
                         and current_step_info in log_lines[last_progress_idx]
@@ -614,14 +680,11 @@ def start_training(trigger_word, project_name, dataset_path, dit_p, qwen_p, vae_
             
             if len(log_lines) > MAX_LOG_LINES: del log_lines[:-MAX_LOG_LINES]
 
-
-            check_image = any(x in line_str.lower() for x in ["saved", "sample", "%|", "it/s", "s/it"])
-            if check_image:
-                current_images = get_latest_images(sample_dir)
-                if len(current_images) != last_image_count:
-                    last_image_count = len(current_images)
-                    yield "\n".join(log_lines), current_images
-                    continue
+            current_images = get_latest_images(sample_dir)
+            if len(current_images) != last_image_count:
+                last_image_count = len(current_images)
+                yield "\n".join(log_lines), current_images
+                continue
 
             yield "\n".join(log_lines), gr.update()
             
@@ -691,7 +754,7 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                 with gr.Row():
                     start_btn = gr.Button("🚀 Start", variant="primary")
                     stop_btn = gr.Button("🛑 Stop", variant="stop")
-                    load_project_btn = gr.Button("📁 Load Project", variant="secondary", min_width=140)
+                    load_project_btn = gr.Button("🔄 Refresh Picker", variant="secondary", min_width=180)
             with gr.Column(scale=1):
                 with gr.Row():
                     rank_input = gr.Number(label="Network Rank", value=cs.get("network_rank", 16), precision=0)
@@ -761,9 +824,14 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
 
     start_btn.click(fn=start_training, inputs=inputs_list, outputs=[output_log, preview_gallery])
     stop_btn.click(fn=stop_training, outputs=output_log)
-    load_project_btn.click(fn=load_project_config, inputs=[project_picker], outputs=inputs_list + [output_log])
     load_project_btn.click(fn=refresh_project_choices, inputs=None, outputs=[project_picker])
+    project_picker.change(fn=load_project_config, inputs=[project_picker], outputs=inputs_list + [output_log])
     load_project_btn.click(
+        fn=compute_prompt_ui_updates,
+        inputs=inputs_list,
+        outputs=[prompt_count_state, pos_prompt_2, pos_prompt_3, pos_prompt_4, pos_prompt_5, add_prompt_btn],
+    )
+    project_picker.change(
         fn=compute_prompt_ui_updates,
         inputs=inputs_list,
         outputs=[prompt_count_state, pos_prompt_2, pos_prompt_3, pos_prompt_4, pos_prompt_5, add_prompt_btn],
