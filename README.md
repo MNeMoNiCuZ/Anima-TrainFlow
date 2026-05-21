@@ -1,5 +1,36 @@
 # Anima TrainFlow
 
+## Original Repo
+https://github.com/ThetaCursed/Anima-TrainFlow
+
+## Changes
+
+- Added a root `requirements.txt` for app dependencies.
+- Added `setup.py` for non-embedded environment setup.
+- Setup now auto-downloads `sd-scripts` if missing.
+- Setup now installs dependencies with `uv pip`.
+- Setup now installs and links `sd-scripts` automatically.
+- Added `launch.py` for interpreter-based app launch.
+- Added `launch.bat` for venv-based app launch.
+- Updated `Install_Requirements.bat` to run `py setup.py`.
+- Split `Project Name` and `Trigger Word` into separate GUI inputs.
+- `Project Name` now controls output/config naming.
+- Added `Project Picker` dropdown listing projects in `training/output`.
+- Added `Load Project` button to load project configs into the GUI.
+- Project loading supports selecting either a project folder or its `configs` folder.
+- Removed `Checkpoint Folder` button.
+- Removed `Created by ThetaCursed` header text.
+- Renamed `Training Steps` to `Max Training Steps`.
+- Added multi-prompt support with a `+` button in the prompt section.
+- Added prompt slots `Prompt 1` to `Prompt 5`.
+- Multiple prompts are now saved/loaded with settings.
+- Prompt file generation now supports multiple prompt lines.
+- Training subprocess now uses current interpreter instead of embedded Python path.
+- Added clearer launch pre-check errors for missing files/modules.
+- Improved log behavior to update tqdm/progress lines in place (less spam).
+
+
+## Original Readme
 Anima TrainFlow is a streamlined, one-page GUI for training LoRA on the **Anima 2B** model. Optimized to run on hardware with as little as **6GB of VRAM**, it eliminates technical overhead by focusing on the essential settings that impact training results the most.
 
 ![Anima TrainFlow Interface Preview](preview.png)
