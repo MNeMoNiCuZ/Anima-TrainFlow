@@ -1,14 +1,5 @@
 # Anima LoRA training script
 
-import os
-import sys
-from pathlib import Path
-
-
-current_script_path = Path(__file__).resolve().parent
-if str(current_script_path) not in sys.path:
-    sys.path.insert(0, str(current_script_path))
-
 import argparse
 from typing import Any, Optional, Union
 

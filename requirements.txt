@@ -1,0 +1,4 @@
+gradio
+psutil
+Pillow
+toml

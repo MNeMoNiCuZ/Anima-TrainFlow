@@ -1,8 +1,8 @@
 import os
 import re
 import json
-import platform
 import subprocess
+import importlib.util
 import toml
 import glob
 import math
@@ -91,10 +91,11 @@ LOG_BLACKLIST = [
 LOG_BOX__MAX_LINES = 16
 GALLERY_HEIGHT = 440
 MAX_LOG_LINES = 500
+MAX_PROMPTS = 5
 
 
 ROOT = Path(__file__).resolve().parent
-PORTABLE_PYTHON = ROOT / "python_embeded" / "python.exe"
+TRAIN_PYTHON = Path(sys.executable).resolve()
 
 TRAIN_BASE = ROOT / "training"
 OUTPUT_BASE = TRAIN_BASE / "output"
@@ -111,6 +112,7 @@ for d in [TRAIN_BASE, OUTPUT_BASE]:
 
 DEFAULT_SETTINGS = {
     "trigger_word": "",
+    "project_name": "",
     "dataset_path": "",
     "dit_path": str(ROOT / "models" / "anima" / "dit" / "anima-preview.safetensors"),
     "qwen_path": str(ROOT / "models" / "anima" / "text_encoder" / "qwen_3_06b_base.safetensors"),
@@ -122,6 +124,10 @@ DEFAULT_SETTINGS = {
     "save_steps": 300,
     "sample_steps": 300,
     "pos_prompt": "",
+    "pos_prompt_2": "",
+    "pos_prompt_3": "",
+    "pos_prompt_4": "",
+    "pos_prompt_5": "",
     "neg_prompt": "worst quality, low quality, score_1, score_2, score_3, artist name",
     "width": 1024,
     "height": 1024,
@@ -132,6 +138,8 @@ DEFAULT_SETTINGS = {
     "train_batch_size": 1,
     "gradient_accumulation_steps": 1
 }
+SETTINGS_KEYS = list(DEFAULT_SETTINGS.keys())
+
 def load_settings():
     settings = DEFAULT_SETTINGS.copy()
     if SETTINGS_FILE.exists():
@@ -147,9 +155,149 @@ def save_settings(settings_dict):
         json.dump(settings_dict, f, indent=4)
 
 def auto_save_state(*args):
-    keys = list(DEFAULT_SETTINGS.keys())
-    current_state = dict(zip(keys, args))
+    current_state = dict(zip(SETTINGS_KEYS, args))
     save_settings(current_state)
+
+def settings_to_values(settings_dict):
+    return [settings_dict.get(k, DEFAULT_SETTINGS[k]) for k in SETTINGS_KEYS]
+
+def get_prompt_count(settings_dict):
+    count = 1
+    for i in range(2, MAX_PROMPTS + 1):
+        if str(settings_dict.get(f"pos_prompt_{i}", "")).strip():
+            count = i
+    return count
+
+def prompt_visibility_updates(count):
+    updates = []
+    for i in range(2, MAX_PROMPTS + 1):
+        updates.append(gr.update(visible=i <= count))
+    updates.append(gr.update(interactive=count < MAX_PROMPTS))
+    return updates
+
+def add_prompt_row(current_count):
+    try:
+        count = int(current_count)
+    except Exception:
+        count = 1
+    next_count = min(MAX_PROMPTS, count + 1)
+    return [gr.update(value=next_count)] + prompt_visibility_updates(next_count)
+
+def compute_prompt_ui_updates(*vals):
+    count = get_prompt_count(dict(zip(SETTINGS_KEYS, vals)))
+    return [gr.update(value=count)] + prompt_visibility_updates(count)
+
+def list_output_projects():
+    if not OUTPUT_BASE.exists():
+        return []
+    return sorted([p.name for p in OUTPUT_BASE.iterdir() if p.is_dir()])
+
+def _normalize_project_input(project_input: str) -> Path:
+    p = Path((project_input or "").strip())
+    if not p:
+        return OUTPUT_BASE / ""
+    if p.is_absolute():
+        if p.name.lower() == "configs":
+            return p.parent
+        return p
+    if p.parts and len(p.parts) >= 2 and p.parts[-1].lower() == "configs":
+        return OUTPUT_BASE / p.parts[-2]
+    return OUTPUT_BASE / p.name
+
+def _read_prompt_file(prompt_path: Path):
+    if not prompt_path.exists():
+        return [""], "", 1024, 1024, 30, 4.0, 42
+    lines = [ln.strip() for ln in prompt_path.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+    if not lines:
+        return [""], "", 1024, 1024, 30, 4.0, 42
+
+    pattern = re.compile(r"^(.*?)\s+--n\s+(.*?)\s+--w\s+(\d+)\s+--h\s+(\d+)\s+--l\s+([0-9.]+)\s+--s\s+(\d+)\s+--d\s+(-?\d+)\s*$")
+    prompts = []
+    neg = ""
+    w, h, steps, cfg, seed = 1024, 1024, 30, 4.0, 42
+    for idx, line in enumerate(lines):
+        m = pattern.match(line)
+        if not m:
+            prompts.append(line)
+            continue
+        pos, neg_line, w_line, h_line, cfg_line, steps_line, seed_line = m.groups()
+        prompts.append(pos)
+        if idx == 0:
+            neg = neg_line
+            w, h = int(w_line), int(h_line)
+            steps, cfg, seed = int(steps_line), float(cfg_line), int(seed_line)
+    return prompts, neg, w, h, steps, cfg, seed
+
+def load_project_config(project_input):
+    project_dir = _normalize_project_input(project_input)
+    configs_dir = project_dir / "configs"
+
+    if not project_dir.exists() or not configs_dir.exists():
+        msg = f"⚠️ Project/configs folder not found: {project_input}"
+        return settings_to_values(load_settings()) + [msg]
+
+    training_files = sorted(configs_dir.glob("*_training.toml"), key=os.path.getmtime, reverse=True)
+    dataset_files = sorted(configs_dir.glob("*_dataset.toml"), key=os.path.getmtime, reverse=True)
+    prompt_files = sorted(configs_dir.glob("*_prompts.txt"), key=os.path.getmtime, reverse=True)
+
+    if not training_files:
+        msg = f"⚠️ No training config found in: {configs_dir}"
+        return settings_to_values(load_settings()) + [msg]
+
+    training_cfg = toml.load(training_files[0])
+    dataset_cfg = toml.load(dataset_files[0]) if dataset_files else {}
+
+    loaded = load_settings()
+    loaded["project_name"] = project_dir.name
+    prefix = (
+        dataset_cfg.get("datasets", [{}])[0]
+        .get("subsets", [{}])[0]
+        .get("caption_prefix")
+    )
+    loaded["trigger_word"] = (prefix or "").replace(", ", "").strip()
+    loaded["dataset_path"] = (
+        dataset_cfg.get("datasets", [{}])[0]
+        .get("subsets", [{}])[0]
+        .get("image_dir", loaded["dataset_path"])
+    )
+    loaded["dit_path"] = training_cfg.get("pretrained_model_name_or_path", loaded["dit_path"])
+    loaded["qwen_path"] = training_cfg.get("qwen3", loaded["qwen_path"])
+    loaded["vae_path"] = training_cfg.get("vae", loaded["vae_path"])
+    loaded["network_rank"] = int(training_cfg.get("network_dim", loaded["network_rank"]))
+    loaded["learning_rate"] = str(training_cfg.get("learning_rate", loaded["learning_rate"]))
+    loaded["optimizer"] = training_cfg.get("optimizer_type", loaded["optimizer"])
+    loaded["training_steps"] = int(training_cfg.get("max_train_steps", loaded["training_steps"]))
+    loaded["save_steps"] = int(training_cfg.get("save_every_n_steps", loaded["save_steps"]))
+    loaded["sample_steps"] = int(training_cfg.get("sample_every_n_steps", loaded["sample_steps"]))
+    loaded["train_seed"] = int(training_cfg.get("seed", loaded["train_seed"]))
+    loaded["train_batch_size"] = int(training_cfg.get("train_batch_size", loaded["train_batch_size"]))
+    loaded["gradient_accumulation_steps"] = int(training_cfg.get("gradient_accumulation_steps", loaded["gradient_accumulation_steps"]))
+
+    prompt_path = Path(training_cfg.get("sample_prompts", "")) if training_cfg.get("sample_prompts") else (prompt_files[0] if prompt_files else None)
+    if prompt_path:
+        prompts, neg, w, h, steps, cfg, seed = _read_prompt_file(prompt_path)
+        cleaned_prompts = []
+        for pos in prompts[:MAX_PROMPTS]:
+            if pos.startswith(loaded["trigger_word"] + ", "):
+                pos = pos[len(loaded["trigger_word"]) + 2:]
+            cleaned_prompts.append(pos)
+        loaded["pos_prompt"] = cleaned_prompts[0] if cleaned_prompts else ""
+        for i in range(2, MAX_PROMPTS + 1):
+            loaded[f"pos_prompt_{i}"] = cleaned_prompts[i - 1] if len(cleaned_prompts) >= i else ""
+        loaded["neg_prompt"] = neg
+        loaded["width"] = w
+        loaded["height"] = h
+        loaded["sample_steps_gen"] = steps
+        loaded["sample_cfg"] = cfg
+        loaded["sample_seed"] = seed
+
+    save_settings(loaded)
+    return settings_to_values(loaded) + [f"✅ Loaded project: {project_dir.name}"]
+
+def refresh_project_choices():
+    choices = list_output_projects()
+    value = choices[0] if choices else None
+    return gr.update(choices=choices, value=value)
 
 
 HIDDEN_SETTINGS = {
@@ -214,19 +362,29 @@ def analyze_dataset_resolution(dataset_path):
     return base_res, max_bucket
 
 
-def create_sample_prompts(project_name, trigger_word, pos_prompt, neg_prompt, width, height, steps_gen, cfg, seed, out_dir):
+def create_sample_prompts(project_name, trigger_word, prompts, neg_prompt, width, height, steps_gen, cfg, seed, out_dir):
     prompt_path = out_dir / f"{project_name}_prompts.txt"
     trigger = trigger_word.strip()
-    user_prompt = pos_prompt.strip().replace("\n", " ")
-    
-    if trigger and not user_prompt.startswith(trigger):
-        actual_pos = f"{trigger}, {user_prompt}" if user_prompt else trigger
-    else:
-        actual_pos = user_prompt if user_prompt else trigger
 
     actual_neg = neg_prompt.strip().replace("\n", " ")
-    prompt_str = f"{actual_pos} --n {actual_neg} --w {int(width)} --h {int(height)} --l {float(cfg)} --s {int(steps_gen)} --d {int(seed)}"
-    with open(prompt_path, "w", encoding="utf-8") as f: f.write(prompt_str)
+    prompt_lines = []
+    for prompt in prompts:
+        user_prompt = prompt.strip().replace("\n", " ")
+        if not user_prompt and not trigger:
+            continue
+        if trigger and not user_prompt.startswith(trigger):
+            actual_pos = f"{trigger}, {user_prompt}" if user_prompt else trigger
+        else:
+            actual_pos = user_prompt if user_prompt else trigger
+        prompt_lines.append(
+            f"{actual_pos} --n {actual_neg} --w {int(width)} --h {int(height)} --l {float(cfg)} --s {int(steps_gen)} --d {int(seed)}"
+        )
+    if not prompt_lines:
+        prompt_lines.append(
+            f"{trigger} --n {actual_neg} --w {int(width)} --h {int(height)} --l {float(cfg)} --s {int(steps_gen)} --d {int(seed)}"
+        )
+    with open(prompt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(prompt_lines))
     return str(prompt_path)
 
 def create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_bucket, out_dir):
@@ -302,7 +460,7 @@ def get_latest_images(sample_dir):
     
     return [(img, Path(img).name) for img in images]
 
-def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc):
+def start_training(trigger_word, project_name, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, pos2, pos3, pos4, pos5, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc):
     global training_process
 
      # --- PATH VALIDATION BLOCK ---
@@ -348,7 +506,7 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
         yield "⚠️ Training is already running!", gr.update()
         return
 
-    project_name = re.sub(r'[^a-zA-Z0-9]', '_', trigger_word.strip()).strip('_') or "untitled"
+    project_name = re.sub(r'[^a-zA-Z0-9]', '_', project_name.strip()).strip('_') or "untitled"
 
     project_out_dir = OUTPUT_BASE / project_name
     sample_dir = project_out_dir / "sample"
@@ -368,12 +526,28 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
     log_lines.append(f"📐 Auto-Resolution Set: Base {base_res}px, Max Bucket {max_bucket}px")
 
     models = {"dit_path": dit_p, "qwen_path": qwen_p, "vae_path": vae_p}
-    prompt_path = create_sample_prompts(project_name, trigger_word, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, project_configs_dir)
+    prompt_path = create_sample_prompts(project_name, trigger_word, [pos, pos2, pos3, pos4, pos5], neg, w, h, s_steps_gen, s_cfg, s_seed, project_configs_dir)
     dataset_toml = create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_bucket, project_configs_dir)
     training_toml = create_training_toml(project_name, project_configs_dir, project_out_dir, rank, lr, optimizer, t_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc)
 
+    launch_errors = []
+    if not TRAIN_PYTHON.exists():
+        launch_errors.append(f"Python executable not found: {TRAIN_PYTHON}")
+    if not TRAIN_SCRIPT.exists():
+        launch_errors.append(f"Training script not found: {TRAIN_SCRIPT}")
+    if importlib.util.find_spec("accelerate") is None:
+        launch_errors.append("Python module not found: accelerate")
+
+    if launch_errors:
+        log_lines.append("❌ Launch pre-check failed:")
+        for msg in launch_errors:
+            log_lines.append(f"- {msg}")
+        log_lines.append("Run setup again in this same venv, then relaunch.")
+        yield "\n".join(log_lines), gr.update()
+        return
+
     cmd = [
-        str(PORTABLE_PYTHON.resolve()), "-m", "accelerate.commands.launch", "--num_processes=1", "--mixed_precision=bf16", "--dynamo_backend=no",
+        str(TRAIN_PYTHON), "-m", "accelerate.commands.launch", "--num_processes=1", "--mixed_precision=bf16", "--dynamo_backend=no",
         TRAIN_SCRIPT.resolve().as_posix(), 
         "--config_file", Path(training_toml).resolve().as_posix(), 
         "--dataset_config", Path(dataset_toml).resolve().as_posix()
@@ -394,6 +568,7 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
         training_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1, cwd=str(TRAIN_DIR.resolve()), env=env, encoding="utf-8", errors="ignore")
         
         
+        last_progress_idx = -1
         for line in iter(training_process.stdout.readline, ""):
             line_str = line.replace('\r', '').strip()
             if not line_str: continue
@@ -409,18 +584,33 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
                 break 
 
            
-            if "steps:" in line_str and "/" in line_str:
+            is_progress_line = (
+                "steps:" in line_str
+                or "%|" in line_str
+                or "it/s" in line_str
+                or "s/it" in line_str
+            )
+            if is_progress_line:
                 match = step_pattern.search(line_str)
                 if match:
                     current_step_info = match.group(0)
-                    if log_lines and "steps:" in log_lines[-1] and current_step_info in log_lines[-1]:
-                        log_lines[-1] = line_str
+                    if (
+                        0 <= last_progress_idx < len(log_lines)
+                        and current_step_info in log_lines[last_progress_idx]
+                    ):
+                        log_lines[last_progress_idx] = line_str
                     else:
                         log_lines.append(line_str)
+                        last_progress_idx = len(log_lines) - 1
                 else:
-                    log_lines.append(line_str)
+                    if 0 <= last_progress_idx < len(log_lines):
+                        log_lines[last_progress_idx] = line_str
+                    else:
+                        log_lines.append(line_str)
+                        last_progress_idx = len(log_lines) - 1
             else:
                 log_lines.append(line_str)
+                last_progress_idx = -1
             
             if len(log_lines) > MAX_LOG_LINES: del log_lines[:-MAX_LOG_LINES]
 
@@ -468,14 +658,6 @@ def stop_training():
             return f"⚠️ Error during stop: {str(e)}"
     return "ℹ️ Not running."
 
-def open_output_folder(trigger_word):
-    proj = re.sub(r'[^a-zA-Z0-9]', '_', trigger_word.strip()).strip('_')
-    target_dir = OUTPUT_BASE / proj if proj else OUTPUT_BASE
-    if not target_dir.exists(): target_dir = OUTPUT_BASE
-    if platform.system() == "Windows": os.startfile(target_dir)
-    else: subprocess.Popen(["xdg-open", str(target_dir)])
-    return "📁 Folder opened."
-
 def handle_optimizer_change(opt, current_lr, saved_adam_lr):
     if opt == "Prodigy": return "1.0", current_lr
     return (saved_adam_lr if current_lr == "1.0" else current_lr), saved_adam_lr
@@ -485,27 +667,31 @@ cs = load_settings()
 
 with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     gr.Markdown(
-        "# Anima TrainFlow\n"
-        '<div class="attribution"><span class="author-text">Created by ThetaCursed</span></div>',
+        "# Anima TrainFlow",
         elem_id="main-header"
     )
     
     saved_adam_lr = gr.State(value="0.00005")
+    prompt_count_state = gr.Number(value=get_prompt_count(cs), visible=False, precision=0)
 
     with gr.Group():
         with gr.Row():
             with gr.Column(scale=1):
                 with gr.Row():
-                    trigger_word = gr.Textbox(label="Trigger Word / Project Name", value=cs.get("trigger_word", ""), placeholder="e.g., unique_style")
-                    dataset_path = gr.Textbox(label="Dataset Path (Images + .txt)", value=cs.get("dataset_path", ""), placeholder="C:/Images/MyDataset")
-                with gr.Accordion("🔧 Paths to Models <- Set Once", open=False):
-                    dit_input = gr.Textbox(label="DiT", value=cs.get("dit_path", ""))
-                    qwen_input = gr.Textbox(label="Qwen3", value=cs.get("qwen_path", ""))
-                    vae_input = gr.Textbox(label="VAE", value=cs.get("vae_path", ""))
+                    project_name = gr.Textbox(label="Project Name", value=cs.get("project_name", ""), placeholder="e.g., anima_character_v1", lines=1, max_lines=1)
+                    trigger_word = gr.Textbox(label="Trigger Word", value=cs.get("trigger_word", ""), placeholder="e.g., unique_style", lines=1, max_lines=1)
+                with gr.Row():
+                    dataset_path = gr.Textbox(label="Dataset Path (Images + .txt)", value=cs.get("dataset_path", ""), placeholder="C:/Images/MyDataset", lines=1, max_lines=1)
+                    project_picker = gr.Dropdown(
+                        label="Project Picker",
+                        choices=list_output_projects(),
+                        value=cs.get("project_name", None),
+                        allow_custom_value=True,
+                    )
                 with gr.Row():
                     start_btn = gr.Button("🚀 Start", variant="primary")
                     stop_btn = gr.Button("🛑 Stop", variant="stop")
-                    folder_btn = gr.Button("📁 Checkpoint Folder", variant="secondary")
+                    load_project_btn = gr.Button("📁 Load Project", variant="secondary", min_width=140)
             with gr.Column(scale=1):
                 with gr.Row():
                     rank_input = gr.Number(label="Network Rank", value=cs.get("network_rank", 16), precision=0)
@@ -514,10 +700,14 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                     train_seed_val = gr.Number(value=cs.get("train_seed", 42), visible=False)
                     batch_size_input = gr.Number(label="Batch Size", value=cs.get("train_batch_size", 1), precision=0)
                 with gr.Row():
-                    steps_input = gr.Number(label="Training Steps", value=cs.get("training_steps", 2400), precision=0)
-                    save_steps_input = gr.Number(label="Save Every n Steps", value=cs.get("save_steps", 300), precision=0)
-                    sample_steps_input = gr.Number(label="Preview Every n Steps", value=cs.get("sample_steps", 300), precision=0)
-                    grad_acc_input = gr.Number(label="Gradient Accumulation", value=cs.get("gradient_accumulation_steps", 1), precision=0)
+                    steps_input = gr.Number(label="Max Training Steps", value=cs.get("training_steps", 2400), precision=0)
+                    save_steps_input = gr.Number(label="Save x Steps", value=cs.get("save_steps", 300), precision=0)
+                    sample_steps_input = gr.Number(label="Preview x Steps", value=cs.get("sample_steps", 300), precision=0)
+                    grad_acc_input = gr.Number(label="Gradient Accum.", value=cs.get("gradient_accumulation_steps", 1), precision=0)
+                with gr.Accordion("🔧 Paths to Models <- Set Once", open=False):
+                    dit_input = gr.Textbox(label="DiT", value=cs.get("dit_path", ""), lines=1, max_lines=1)
+                    qwen_input = gr.Textbox(label="Qwen3", value=cs.get("qwen_path", ""), lines=1, max_lines=1)
+                    vae_input = gr.Textbox(label="VAE", value=cs.get("vae_path", ""), lines=1, max_lines=1)
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -525,7 +715,24 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
         with gr.Column(scale=1):
             preview_gallery = gr.Gallery(label="Previews", columns=2, rows=2, height=GALLERY_HEIGHT, object_fit="contain")
             with gr.Group():
-                pos_prompt = gr.Textbox(label="Prompt (Trigger word added automatically)", lines=2, value=cs.get("pos_prompt", ""))
+                with gr.Row():
+                    pos_prompt = gr.Textbox(
+                        label="Prompt 1 (Trigger word added automatically)",
+                        lines=2,
+                        value=cs.get("pos_prompt", ""),
+                        scale=20,
+                    )
+                    add_prompt_btn = gr.Button(
+                        "+ Add Prompt",
+                        variant="secondary",
+                        min_width=130,
+                        scale=1,
+                        interactive=get_prompt_count(cs) < MAX_PROMPTS,
+                    )
+                pos_prompt_2 = gr.Textbox(label="Prompt 2", lines=2, value=cs.get("pos_prompt_2", ""), visible=get_prompt_count(cs) >= 2)
+                pos_prompt_3 = gr.Textbox(label="Prompt 3", lines=2, value=cs.get("pos_prompt_3", ""), visible=get_prompt_count(cs) >= 3)
+                pos_prompt_4 = gr.Textbox(label="Prompt 4", lines=2, value=cs.get("pos_prompt_4", ""), visible=get_prompt_count(cs) >= 4)
+                pos_prompt_5 = gr.Textbox(label="Prompt 5", lines=2, value=cs.get("pos_prompt_5", ""), visible=get_prompt_count(cs) >= 5)
                 neg_prompt = gr.Textbox(label="Negative Prompt", lines=1, value=cs.get("neg_prompt", ""))
                 with gr.Row():
                     width_input = gr.Number(label="Width", value=cs.get("width", 1024), precision=0, min_width=80)
@@ -535,16 +742,16 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                     sample_seed_input = gr.Number(label="Seed", value=cs.get("sample_seed", 42), precision=0, min_width=80)
 
     inputs_list = [
-        trigger_word, dataset_path, dit_input, qwen_input, vae_input,
+        trigger_word, project_name, dataset_path, dit_input, qwen_input, vae_input,
         rank_input, lr_input, optimizer_input, 
         steps_input, save_steps_input, sample_steps_input,
-        pos_prompt, neg_prompt, width_input, height_input,
+        pos_prompt, pos_prompt_2, pos_prompt_3, pos_prompt_4, pos_prompt_5, neg_prompt, width_input, height_input,
         sample_steps_gen_input, sample_cfg_input, sample_seed_input, train_seed_val, batch_size_input, grad_acc_input
     ]
 
     def load_state_on_refresh():
         current_settings = load_settings()
-        return [current_settings.get(k, DEFAULT_SETTINGS[k]) for k in DEFAULT_SETTINGS.keys()]
+        return settings_to_values(current_settings)
 
     ui.load(fn=load_state_on_refresh, inputs=None, outputs=inputs_list)    
 
@@ -554,7 +761,18 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
 
     start_btn.click(fn=start_training, inputs=inputs_list, outputs=[output_log, preview_gallery])
     stop_btn.click(fn=stop_training, outputs=output_log)
-    folder_btn.click(fn=open_output_folder, inputs=[trigger_word], outputs=output_log)
+    load_project_btn.click(fn=load_project_config, inputs=[project_picker], outputs=inputs_list + [output_log])
+    load_project_btn.click(fn=refresh_project_choices, inputs=None, outputs=[project_picker])
+    load_project_btn.click(
+        fn=compute_prompt_ui_updates,
+        inputs=inputs_list,
+        outputs=[prompt_count_state, pos_prompt_2, pos_prompt_3, pos_prompt_4, pos_prompt_5, add_prompt_btn],
+    )
+    add_prompt_btn.click(
+        fn=add_prompt_row,
+        inputs=[prompt_count_state],
+        outputs=[prompt_count_state, pos_prompt_2, pos_prompt_3, pos_prompt_4, pos_prompt_5, add_prompt_btn],
+    )
 
 if __name__ == "__main__":
      ui.launch(inbrowser=True, theme=gr.themes.Soft(), css=CSS)
