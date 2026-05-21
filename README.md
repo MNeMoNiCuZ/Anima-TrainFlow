@@ -17,6 +17,16 @@ https://github.com/ThetaCursed/Anima-TrainFlow
 - Added support for multiple preview images.
 - Renamed some GUI elements and limited the rows so they fit better
 
+## Requirements
+```
+Python 3.10
+torch 2.11.0+cu128
+CUDA 12.8
+```
+
+## Setup
+Run `venv_create.bat` to create the virtual environment
+Run `py setup.py` to clone the sd-scripts repo and other requirements
 
 ## Original Readme
 Anima TrainFlow is a streamlined, one-page GUI for training LoRA on the **Anima 2B** model. Optimized to run on hardware with as little as **6GB of VRAM**, it eliminates technical overhead by focusing on the essential settings that impact training results the most.
