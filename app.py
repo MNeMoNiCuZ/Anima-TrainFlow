@@ -431,8 +431,6 @@ def create_training_toml(project_name, config_save_dir, actual_output_dir, rank,
         "output_dir": actual_output_dir.resolve().as_posix(),
         "output_name": project_name,
         "save_every_n_steps": int(save_steps),
-        "save_state": True,
-        "save_state_on_train_end": True,
         "sample_every_n_steps": int(sample_steps),
         "sample_prompts": Path(prompt_path).resolve().as_posix(),
         "sample_sampler": "euler",
@@ -730,7 +728,7 @@ cs = load_settings()
 
 with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     gr.Markdown(
-        "# Anima TrainFlow",
+        '# <span title="Original repo creator: ThetaCursed">Anima TrainFlow</span> <a href="https://github.com/MNeMoNiCuZ/Anima-TrainFlow" title="This fork maintained by MNeMoNiCuZ" target="_blank">🔗</a>',
         elem_id="main-header"
     )
     
