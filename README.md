@@ -4,17 +4,18 @@
 https://github.com/ThetaCursed/Anima-TrainFlow
 
 ## Changes
+### New Features
+- Config loader so you can switch between configs
+- Multiple preview images
+- Resume previous training
 
+### Clean-up
 - Removed embedded python
 - Added virtual environment creation script
 - Added `setup.py` setup script for automatic setup
    - It uses `uv`
 - Removed `sd-scripts` and have it automatically clone/download it
-- Added gui launcher scripts
-- Added requriements.txt file
 - Separated Project Name and Trigger Word properties
-- Added a project picker and config loader
-- Added support for multiple preview images.
 - Renamed some GUI elements and limited the rows so they fit better
 
 ## Requirements
