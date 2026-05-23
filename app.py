@@ -80,6 +80,24 @@ function() {
 }
 """
 
+JS_INIT_TOOLTIPS = """
+function() {
+    const tips = {
+        "btn-start": "Start training with the current settings",
+        "btn-stop": "Stop the current training process",
+        "btn-refresh-picker": "Refresh the project list",
+        "btn-new": "Create a new project with an auto-generated unique name",
+        "btn-clone": "Clone current settings into a new project with a unique name"
+    };
+    Object.entries(tips).forEach(([id, tip]) => {
+        const root = document.getElementById(id);
+        if (!root) return;
+        const btn = root.querySelector("button") || root;
+        btn.setAttribute("title", tip);
+    });
+}
+"""
+
 
 LOG_BLACKLIST = [
     "triton not found",
@@ -724,6 +742,58 @@ def handle_optimizer_change(opt, current_lr, saved_adam_lr):
     return (saved_adam_lr if current_lr == "1.0" else current_lr), saved_adam_lr
 
 
+def _unique_project_name(base_name):
+    base_clean = re.sub(r'[^a-zA-Z0-9]', '_', (base_name or "").strip()).strip('_') or "untitled"
+    existing = {p.lower() for p in list_output_projects()}
+    if base_clean.lower() not in existing:
+        return base_clean
+    i = 2
+    while f"{base_clean}_{i}".lower() in existing:
+        i += 1
+    return f"{base_clean}_{i}"
+
+
+def new_project_action():
+    new_name_clean = _unique_project_name("untitled")
+    new_settings = DEFAULT_SETTINGS.copy()
+    new_settings["project_name"] = new_name_clean
+    save_settings(new_settings)
+    project_out_dir = OUTPUT_BASE / new_name_clean
+    for d in [project_out_dir, project_out_dir / "configs", project_out_dir / "sample"]:
+        d.mkdir(parents=True, exist_ok=True)
+    choices = list_output_projects()
+    new_vals = settings_to_values(new_settings)
+    count = get_prompt_count(new_settings)
+    return (
+        new_vals
+        + [gr.update(choices=choices, value=new_name_clean)]
+        + [f"✅ New project created: {new_name_clean}"]
+        + [gr.update(value=count)]
+        + prompt_visibility_updates(count)
+    )
+
+def clone_project_action(*current_input_values):
+    current_settings = dict(zip(SETTINGS_KEYS, current_input_values))
+    base_name = f"{current_settings.get('project_name', '')}_clone"
+    new_name_clean = _unique_project_name(base_name)
+    current_settings["project_name"] = new_name_clean
+    save_settings(current_settings)
+    project_out_dir = OUTPUT_BASE / new_name_clean
+    for d in [project_out_dir, project_out_dir / "configs", project_out_dir / "sample"]:
+        d.mkdir(parents=True, exist_ok=True)
+    choices = list_output_projects()
+    cloned_vals = settings_to_values(current_settings)
+    count = get_prompt_count(current_settings)
+    return (
+        cloned_vals
+        + [gr.update(choices=choices, value=new_name_clean)]
+        + [f"✅ Cloned to: {new_name_clean}"]
+        + [gr.update(value=count)]
+        + prompt_visibility_updates(count)
+    )
+
+
+
 cs = load_settings()
 
 with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
@@ -750,9 +820,11 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                         allow_custom_value=True,
                     )
                 with gr.Row():
-                    start_btn = gr.Button("🚀 Start", variant="primary")
-                    stop_btn = gr.Button("🛑 Stop", variant="stop")
-                    load_project_btn = gr.Button("🔄 Refresh Picker", variant="secondary", min_width=180)
+                    start_btn = gr.Button("🚀 Start", variant="primary", scale=1, min_width=0, elem_id="btn-start")
+                    stop_btn = gr.Button("🛑 Stop", variant="stop", scale=1, min_width=0, elem_id="btn-stop")
+                    new_project_btn = gr.Button("✨ New", variant="secondary", scale=1, min_width=0, elem_id="btn-new")
+                    clone_project_btn = gr.Button("📋 Clone", variant="secondary", scale=1, min_width=0, elem_id="btn-clone")
+                    load_project_btn = gr.Button("🔄 Refresh", variant="secondary", scale=1, min_width=0, elem_id="btn-refresh-picker")
             with gr.Column(scale=1):
                 with gr.Row():
                     rank_input = gr.Number(label="Network Rank", value=cs.get("network_rank", 16), precision=0)
@@ -814,7 +886,7 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
         current_settings = load_settings()
         return settings_to_values(current_settings)
 
-    ui.load(fn=load_state_on_refresh, inputs=None, outputs=inputs_list)    
+    ui.load(fn=load_state_on_refresh, inputs=None, outputs=inputs_list, js=JS_INIT_TOOLTIPS)    
 
     output_log.change(None, None, None, js=JS_SCROLL)
     optimizer_input.change(fn=handle_optimizer_change, inputs=[optimizer_input, lr_input, saved_adam_lr], outputs=[lr_input, saved_adam_lr])
@@ -840,5 +912,19 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
         outputs=[prompt_count_state, pos_prompt_2, pos_prompt_3, pos_prompt_4, pos_prompt_5, add_prompt_btn],
     )
 
+    _project_action_outputs = inputs_list + [project_picker, output_log, prompt_count_state, pos_prompt_2, pos_prompt_3, pos_prompt_4, pos_prompt_5, add_prompt_btn]
+    new_project_btn.click(
+        fn=new_project_action,
+        inputs=None,
+        outputs=_project_action_outputs,
+    )
+    clone_project_btn.click(
+        fn=clone_project_action,
+        inputs=inputs_list,
+        outputs=_project_action_outputs,
+    )
+
 if __name__ == "__main__":
      ui.launch(inbrowser=True, theme=gr.themes.Soft(), css=CSS)
+
+

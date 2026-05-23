@@ -17,7 +17,7 @@ def main() -> int:
 
     print("Starting Anima TrainFlow...")
     print()
-    return subprocess.call([sys.executable, str(APP)], cwd=str(ROOT))
+    return subprocess.call([sys.executable, str(APP)] + sys.argv[1:], cwd=str(ROOT))
 
 
 if __name__ == "__main__":

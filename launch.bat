@@ -13,7 +13,7 @@ if not exist "%PY_EXE%" (
     exit /b 1
 )
 
-"%PY_EXE%" launch.py
+"%PY_EXE%" launch.py %*
 
 if %errorlevel% neq 0 (
     echo.
