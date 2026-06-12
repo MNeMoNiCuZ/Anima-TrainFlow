@@ -67,6 +67,11 @@ footer {
     display: none !important;
 }
 
+#btn-start button, #btn-stop button, #btn-new button, #btn-clone button, #btn-save button, #btn-refresh-picker button {
+    padding-left: 0.5rem !important;
+    padding-right: 0.5rem !important;
+}
+
 """
 
 JS_SCROLL = """
@@ -86,8 +91,8 @@ function() {
         "btn-start": "Start training with the current settings",
         "btn-stop": "Stop the current training process",
         "btn-refresh-picker": "Refresh the project list",
-        "btn-new": "Create a new project with an auto-generated unique name",
-        "btn-clone": "Clone current settings into a new project with a unique name"
+        "btn-open": "Open the current project folder in Explorer",
+        "btn-save": "Save current settings"
     };
     Object.entries(tips).forEach(([id, tip]) => {
         const root = document.getElementById(id);
@@ -105,6 +110,8 @@ LOG_BLACKLIST = [
     "Lib\\site-packages\\torch\\utils\\flop_counter.py"
 ]
 
+
+NEW_PROJECT_SENTINEL = "➕ New Project"
 
 LOG_BOX__MAX_LINES = 16
 GALLERY_HEIGHT = 440
@@ -172,9 +179,103 @@ def save_settings(settings_dict):
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(settings_dict, f, indent=4)
 
-def auto_save_state(*args):
-    current_state = dict(zip(SETTINGS_KEYS, args))
-    save_settings(current_state)
+def write_project_configs(settings_dict):
+    project_name_raw = settings_dict.get("project_name", "").strip()
+    if not project_name_raw:
+        return
+    project_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', project_name_raw).strip('_') or "untitled"
+    project_out_dir = OUTPUT_BASE / project_name_clean
+    project_configs_dir = project_out_dir / "configs"
+    for d in [project_out_dir, project_out_dir / "sample", project_configs_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+    pos_prompts = [settings_dict.get(k, "") for k in ["pos_prompt", "pos_prompt_2", "pos_prompt_3", "pos_prompt_4", "pos_prompt_5"]]
+    models = {"dit_path": settings_dict.get("dit_path", ""), "qwen_path": settings_dict.get("qwen_path", ""), "vae_path": settings_dict.get("vae_path", "")}
+    dataset_path = settings_dict.get("dataset_path", "")
+    base_res, max_bucket = analyze_dataset_resolution(dataset_path)
+    prompt_path = create_sample_prompts(project_name_clean, settings_dict.get("trigger_word", ""), pos_prompts, settings_dict.get("neg_prompt", ""), settings_dict.get("width", 1024), settings_dict.get("height", 1024), settings_dict.get("sample_steps_gen", 30), settings_dict.get("sample_cfg", 4.0), settings_dict.get("sample_seed", 42), project_configs_dir)
+    create_dataset_toml(project_name_clean, dataset_path, settings_dict.get("trigger_word", ""), base_res, max_bucket, project_configs_dir)
+    create_training_toml(project_name_clean, project_configs_dir, project_out_dir, settings_dict.get("network_rank", 32), settings_dict.get("learning_rate", "1.0"), settings_dict.get("optimizer", "Prodigy"), settings_dict.get("training_steps", 2400), settings_dict.get("save_steps", 300), settings_dict.get("sample_steps", 300), models, prompt_path, settings_dict.get("train_seed", 42), settings_dict.get("train_batch_size", 1), settings_dict.get("gradient_accumulation_steps", 1))
+
+def _rename_prefixed_files(directory, old_prefix, new_prefix):
+    """Rename all files/dirs inside `directory` whose names start with `old_prefix`."""
+    if not directory.exists():
+        return
+    for entry in list(directory.iterdir()):
+        if entry.name.startswith(old_prefix):
+            new_entry_name = new_prefix + entry.name[len(old_prefix):]
+            entry.rename(directory / new_entry_name)
+
+def rename_project_contents(project_dir, old_name, new_name):
+    """Rename every file/dir inside a project folder that is prefixed with old_name."""
+    _rename_prefixed_files(project_dir / "configs", old_name, new_name)
+    _rename_prefixed_files(project_dir / "sample", old_name, new_name)
+    _rename_prefixed_files(project_dir, old_name, new_name)
+
+def _detect_old_prefix(project_dir, fallback):
+    """Find the filename prefix actually used by a project's config files.
+    It can differ from the folder name (e.g. a folder duplicated in Explorer as
+    'X - Copy' still holds files named 'X_training.toml')."""
+    configs = project_dir / "configs"
+    if configs.exists():
+        for suffix in ("_training.toml", "_dataset.toml", "_prompts.txt"):
+            for f in sorted(configs.glob(f"*{suffix}")):
+                return f.name[: -len(suffix)]
+    return fallback
+
+def validate_project_name(raw_name):
+    """Return (sanitized_name, error_msg). error_msg is None when valid."""
+    raw_name = (raw_name or "").strip()
+    if not raw_name:
+        return None, "⚠️ Project name cannot be empty."
+    sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', raw_name).strip('_')
+    if not sanitized:
+        return None, f"⚠️ '{raw_name}' contains no valid characters. Use letters, numbers, or underscores."
+    return sanitized, None
+
+def _clean_name(name):
+    return re.sub(r'[^a-zA-Z0-9_]', '_', (name or "").strip()).strip('_')
+
+def save_state(picker_value, folder_tracker, *args):
+    settings_dict = dict(zip(SETTINGS_KEYS, args))
+    new_name, err = validate_project_name(settings_dict.get("project_name", ""))
+    if err:
+        return err, gr.update(), gr.update(), gr.update()
+    # Persist the sanitized (legal) name, not the raw typed text.
+    settings_dict["project_name"] = new_name
+
+    # Determine the project's current on-disk folder name (what to rename FROM).
+    # Three independent signals, most reliable first:
+    #   1. the project picker's current selection (the loaded project),
+    #   2. settings.json (rewritten on every load/new/clone/train),
+    #   3. the hidden UI tracker.
+    # Match the RAW name exactly as it sits on disk -- real folders may contain
+    # spaces/hyphens (e.g. duplicated as "X - Copy"), so we must NOT sanitize
+    # before checking existence. Only the NEW name gets legalized.
+    if picker_value == NEW_PROJECT_SENTINEL:
+        picker_value = ""
+    raw_candidates = [picker_value, load_settings().get("project_name", ""), folder_tracker]
+    old_name = ""
+    for c in raw_candidates:
+        c = (c or "").strip()
+        if c and c != new_name and (OUTPUT_BASE / c).is_dir():
+            old_name = c
+            break
+
+    new_dir = OUTPUT_BASE / new_name
+    msg = "✅ Settings saved."
+    if old_name:
+        if new_dir.exists():
+            msg = f"⚠️ Cannot rename: '{new_name}' already exists. Settings saved without renaming."
+        else:
+            (OUTPUT_BASE / old_name).rename(new_dir)
+            old_prefix = _detect_old_prefix(new_dir, old_name)
+            rename_project_contents(new_dir, old_prefix, new_name)
+            msg = f"✅ Renamed '{old_name}' → '{new_name}' and saved."
+
+    save_settings(settings_dict)
+    write_project_configs(settings_dict)
+    projects = list_output_projects()
+    return msg, gr.update(choices=[NEW_PROJECT_SENTINEL] + projects, value=new_name), new_name, gr.update(value=new_name)
 
 def settings_to_values(settings_dict):
     return [settings_dict.get(k, DEFAULT_SETTINGS[k]) for k in SETTINGS_KEYS]
@@ -252,7 +353,7 @@ def load_project_config(project_input):
 
     if not project_dir.exists() or not configs_dir.exists():
         msg = f"⚠️ Project/configs folder not found: {project_input}"
-        return settings_to_values(load_settings()) + [msg]
+        return settings_to_values(load_settings()) + [[], msg]
 
     training_files = sorted(configs_dir.glob("*_training.toml"), key=os.path.getmtime, reverse=True)
     dataset_files = sorted(configs_dir.glob("*_dataset.toml"), key=os.path.getmtime, reverse=True)
@@ -260,7 +361,7 @@ def load_project_config(project_input):
 
     if not training_files:
         msg = f"⚠️ No training config found in: {configs_dir}"
-        return settings_to_values(load_settings()) + [msg]
+        return settings_to_values(load_settings()) + [[], msg]
 
     training_cfg = toml.load(training_files[0])
     dataset_cfg = toml.load(dataset_files[0]) if dataset_files else {}
@@ -310,11 +411,14 @@ def load_project_config(project_input):
         loaded["sample_seed"] = seed
 
     save_settings(loaded)
-    return settings_to_values(loaded) + [f"✅ Loaded project: {project_dir.name}"]
+    sample_dir = project_dir / "sample"
+    return settings_to_values(loaded) + [get_latest_images(sample_dir), f"✅ Loaded project: {project_dir.name}"]
 
-def refresh_project_choices():
-    choices = list_output_projects()
-    value = choices[0] if choices else None
+def refresh_project_choices(current_value):
+    projects = list_output_projects()
+    choices = [NEW_PROJECT_SENTINEL] + projects
+    # Keep the current selection if it still exists; only fall back otherwise.
+    value = current_value if current_value in choices else (projects[0] if projects else None)
     return gr.update(choices=choices, value=value)
 
 
@@ -554,7 +658,10 @@ def start_training(trigger_word, project_name, dataset_path, dit_p, qwen_p, vae_
         yield "⚠️ Training is already running!", gr.update()
         return
 
-    project_name = re.sub(r'[^a-zA-Z0-9]', '_', project_name.strip()).strip('_') or "untitled"
+    project_name = re.sub(r'[^a-zA-Z0-9_]', '_', project_name.strip()).strip('_') or "untitled"
+    cur = load_settings()
+    cur["project_name"] = project_name
+    save_settings(cur)
 
     project_out_dir = OUTPUT_BASE / project_name
     sample_dir = project_out_dir / "sample"
@@ -743,7 +850,7 @@ def handle_optimizer_change(opt, current_lr, saved_adam_lr):
 
 
 def _unique_project_name(base_name):
-    base_clean = re.sub(r'[^a-zA-Z0-9]', '_', (base_name or "").strip()).strip('_') or "untitled"
+    base_clean = re.sub(r'[^a-zA-Z0-9_]', '_', (base_name or "").strip()).strip('_') or "untitled"
     existing = {p.lower() for p in list_output_projects()}
     if base_clean.lower() not in existing:
         return base_clean
@@ -753,6 +860,16 @@ def _unique_project_name(base_name):
     return f"{base_clean}_{i}"
 
 
+def open_project_folder(project_name):
+    project_name = (project_name or "").strip()
+    if not project_name or project_name == NEW_PROJECT_SENTINEL:
+        return "⚠️ No project selected."
+    project_dir = OUTPUT_BASE / re.sub(r'[^a-zA-Z0-9_]', '_', project_name).strip('_')
+    if not project_dir.exists():
+        return f"⚠️ Project folder not found: {project_dir}"
+    os.startfile(str(project_dir))
+    return f"📂 Opened: {project_dir.name}"
+
 def new_project_action():
     new_name_clean = _unique_project_name("untitled")
     new_settings = DEFAULT_SETTINGS.copy()
@@ -761,7 +878,7 @@ def new_project_action():
     project_out_dir = OUTPUT_BASE / new_name_clean
     for d in [project_out_dir, project_out_dir / "configs", project_out_dir / "sample"]:
         d.mkdir(parents=True, exist_ok=True)
-    choices = list_output_projects()
+    choices = [NEW_PROJECT_SENTINEL] + list_output_projects()
     new_vals = settings_to_values(new_settings)
     count = get_prompt_count(new_settings)
     return (
@@ -781,7 +898,7 @@ def clone_project_action(*current_input_values):
     project_out_dir = OUTPUT_BASE / new_name_clean
     for d in [project_out_dir, project_out_dir / "configs", project_out_dir / "sample"]:
         d.mkdir(parents=True, exist_ok=True)
-    choices = list_output_projects()
+    choices = [NEW_PROJECT_SENTINEL] + list_output_projects()
     cloned_vals = settings_to_values(current_settings)
     count = get_prompt_count(current_settings)
     return (
@@ -796,7 +913,7 @@ def clone_project_action(*current_input_values):
 
 cs = load_settings()
 
-with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
+with gr.Blocks(title="Anima TrainFlow") as ui:
     gr.Markdown(
         '# <span title="Original repo creator: ThetaCursed">Anima TrainFlow</span> <a href="https://github.com/MNeMoNiCuZ/Anima-TrainFlow" title="This fork maintained by MNeMoNiCuZ" target="_blank">🔗</a>',
         elem_id="main-header"
@@ -804,6 +921,9 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     
     saved_adam_lr = gr.State(value="0.00005")
     prompt_count_state = gr.Number(value=get_prompt_count(cs), visible=False, precision=0)
+    # Tracks the actual on-disk folder name of the currently loaded project.
+    # Updated by every "project loaded" event. Never touched by the user typing in project_name.
+    _folder_tracker = gr.Textbox(visible=False, value=cs.get("project_name", ""))
 
     with gr.Group():
         with gr.Row():
@@ -815,16 +935,24 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                     dataset_path = gr.Textbox(label="Dataset Path (Images + .txt)", value=cs.get("dataset_path", ""), placeholder="C:/Images/MyDataset", lines=1, max_lines=1)
                     project_picker = gr.Dropdown(
                         label="Project Picker",
-                        choices=list_output_projects(),
+                        choices=[NEW_PROJECT_SENTINEL] + list_output_projects(),
                         value=cs.get("project_name", None),
                         allow_custom_value=True,
                     )
                 with gr.Row():
                     start_btn = gr.Button("🚀 Start", variant="primary", scale=1, min_width=0, elem_id="btn-start")
                     stop_btn = gr.Button("🛑 Stop", variant="stop", scale=1, min_width=0, elem_id="btn-stop")
-                    new_project_btn = gr.Button("✨ New", variant="secondary", scale=1, min_width=0, elem_id="btn-new")
-                    clone_project_btn = gr.Button("📋 Clone", variant="secondary", scale=1, min_width=0, elem_id="btn-clone")
+                    open_folder_btn = gr.Button("📁 Open", variant="secondary", scale=1, min_width=0, elem_id="btn-open")
                     load_project_btn = gr.Button("🔄 Refresh", variant="secondary", scale=1, min_width=0, elem_id="btn-refresh-picker")
+                    save_btn = gr.Button("💾 Save", variant="secondary", scale=1, min_width=0, elem_id="btn-save")
+                with gr.Group(visible=False) as new_project_modal:
+                    gr.Markdown("**Create Project**")
+                    with gr.Row():
+                        modal_name_input = gr.Textbox(label="Project Name", placeholder="Leave empty for auto-generated name", scale=3)
+                        modal_type_radio = gr.Radio(["New Project", "Clone Current"], value="New Project", label="Type", scale=1)
+                    with gr.Row():
+                        modal_confirm_btn = gr.Button("✅ Create", variant="primary", scale=1, min_width=0)
+                        modal_cancel_btn = gr.Button("❌ Cancel", scale=1, min_width=0)
             with gr.Column(scale=1):
                 with gr.Row():
                     rank_input = gr.Number(label="Network Rank", value=cs.get("network_rank", 16), precision=0)
@@ -846,7 +974,8 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
         with gr.Column(scale=1):
             output_log = gr.Textbox(label="Logs", lines=LOG_BOX__MAX_LINES, max_lines=LOG_BOX__MAX_LINES, interactive=False, autoscroll=True, elem_id="log-container")
         with gr.Column(scale=1):
-            preview_gallery = gr.Gallery(label="Previews", columns=2, rows=2, height=GALLERY_HEIGHT, object_fit="contain")
+            with gr.Accordion("🖼️ Sample Gallery", open=True):
+                preview_gallery = gr.Gallery(label="Previews", columns=2, rows=2, height=GALLERY_HEIGHT, object_fit="contain", show_label=False)
             with gr.Group():
                 with gr.Row():
                     pos_prompt = gr.Textbox(
@@ -884,18 +1013,66 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
 
     def load_state_on_refresh():
         current_settings = load_settings()
-        return settings_to_values(current_settings)
+        return settings_to_values(current_settings) + [current_settings.get("project_name", "")]
 
-    ui.load(fn=load_state_on_refresh, inputs=None, outputs=inputs_list, js=JS_INIT_TOOLTIPS)    
+    ui.load(fn=load_state_on_refresh, inputs=None, outputs=inputs_list + [_folder_tracker], js=JS_INIT_TOOLTIPS)    
 
     output_log.change(None, None, None, js=JS_SCROLL)
     optimizer_input.change(fn=handle_optimizer_change, inputs=[optimizer_input, lr_input, saved_adam_lr], outputs=[lr_input, saved_adam_lr])
-    for comp in inputs_list: comp.change(fn=auto_save_state, inputs=inputs_list)
 
+    def maybe_load_project(val):
+        if val == NEW_PROJECT_SENTINEL:
+            return [gr.update()] * (len(inputs_list) + 3)  # +2 gallery+log, +1 tracker
+        result = load_project_config(val)
+        # result = settings_to_values + [images, log_msg]
+        # Extract the sanitized folder name from the loaded project_name value
+        folder_name = result[SETTINGS_KEYS.index("project_name")]
+        return result + [folder_name]
+
+    def cancel_modal():
+        projects = list_output_projects()
+        val = projects[0] if projects else None
+        return gr.update(visible=False), gr.update(choices=[NEW_PROJECT_SENTINEL] + projects, value=val)
+
+    def modal_create_action(modal_name, modal_type, *current_inputs):
+        current_settings = dict(zip(SETTINGS_KEYS, current_inputs))
+        if modal_type == "Clone Current":
+            base_name = modal_name.strip() or f"{current_settings.get('project_name', '')}_clone"
+            new_settings = current_settings.copy()
+        else:
+            base_name = modal_name.strip() or "untitled"
+            new_settings = DEFAULT_SETTINGS.copy()
+        new_name_clean = _unique_project_name(base_name)
+        new_settings["project_name"] = new_name_clean
+        save_settings(new_settings)
+        write_project_configs(new_settings)
+        project_out_dir = OUTPUT_BASE / new_name_clean
+        for d in [project_out_dir, project_out_dir / "configs", project_out_dir / "sample"]:
+            d.mkdir(parents=True, exist_ok=True)
+        choices = [NEW_PROJECT_SENTINEL] + list_output_projects()
+        new_vals = settings_to_values(new_settings)
+        count = get_prompt_count(new_settings)
+        msg = f"✅ {'Cloned to' if modal_type == 'Clone Current' else 'New project created'}: {new_name_clean}"
+        return (
+            new_vals
+            + [gr.update(choices=choices, value=new_name_clean)]
+            + [msg]
+            + [gr.update(value=count)]
+            + prompt_visibility_updates(count)
+            + [gr.update(visible=False)]
+            + [new_name_clean]
+        )
+
+    save_btn.click(fn=save_state, inputs=[project_picker, _folder_tracker] + inputs_list, outputs=[output_log, project_picker, _folder_tracker, project_name])
     start_btn.click(fn=start_training, inputs=inputs_list, outputs=[output_log, preview_gallery])
     stop_btn.click(fn=stop_training, outputs=output_log)
-    load_project_btn.click(fn=refresh_project_choices, inputs=None, outputs=[project_picker])
-    project_picker.change(fn=load_project_config, inputs=[project_picker], outputs=inputs_list + [output_log])
+    load_project_btn.click(fn=refresh_project_choices, inputs=[project_picker], outputs=[project_picker])
+    project_picker.change(fn=maybe_load_project, inputs=[project_picker], outputs=inputs_list + [preview_gallery, output_log, _folder_tracker])
+    project_picker.change(
+        fn=lambda v: gr.update(visible=(v == NEW_PROJECT_SENTINEL)),
+        inputs=[project_picker],
+        outputs=[new_project_modal],
+    )
     load_project_btn.click(
         fn=compute_prompt_ui_updates,
         inputs=inputs_list,
@@ -912,17 +1089,11 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
         outputs=[prompt_count_state, pos_prompt_2, pos_prompt_3, pos_prompt_4, pos_prompt_5, add_prompt_btn],
     )
 
-    _project_action_outputs = inputs_list + [project_picker, output_log, prompt_count_state, pos_prompt_2, pos_prompt_3, pos_prompt_4, pos_prompt_5, add_prompt_btn]
-    new_project_btn.click(
-        fn=new_project_action,
-        inputs=None,
-        outputs=_project_action_outputs,
-    )
-    clone_project_btn.click(
-        fn=clone_project_action,
-        inputs=inputs_list,
-        outputs=_project_action_outputs,
-    )
+    modal_cancel_btn.click(fn=cancel_modal, outputs=[new_project_modal, project_picker])
+    _modal_outputs = inputs_list + [project_picker, output_log, prompt_count_state, pos_prompt_2, pos_prompt_3, pos_prompt_4, pos_prompt_5, add_prompt_btn, new_project_modal, _folder_tracker]
+    modal_confirm_btn.click(fn=modal_create_action, inputs=[modal_name_input, modal_type_radio] + inputs_list, outputs=_modal_outputs)
+
+    open_folder_btn.click(fn=open_project_folder, inputs=[project_name], outputs=output_log)
 
 if __name__ == "__main__":
      ui.launch(inbrowser=True, theme=gr.themes.Soft(), css=CSS)
