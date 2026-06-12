@@ -67,6 +67,16 @@ footer {
     display: none !important;
 }
 
+/* Remove the up/down spinner "ticker" from number inputs. */
+input[type=number]::-webkit-inner-spin-button,
+input[type=number]::-webkit-outer-spin-button {
+    -webkit-appearance: none !important;
+    margin: 0 !important;
+}
+input[type=number] {
+    -moz-appearance: textfield !important;
+}
+
 #btn-start button, #btn-stop button, #btn-new button, #btn-clone button, #btn-save button, #btn-refresh-picker button {
     padding-left: 0.5rem !important;
     padding-right: 0.5rem !important;
@@ -85,23 +95,64 @@ function() {
 }
 """
 
-JS_INIT_TOOLTIPS = """
-function() {
-    const tips = {
-        "btn-start": "Start training with the current settings",
-        "btn-stop": "Stop the current training process",
-        "btn-refresh-picker": "Refresh the project list",
-        "btn-open": "Open the current project folder in Explorer",
-        "btn-save": "Save current settings"
-    };
-    Object.entries(tips).forEach(([id, tip]) => {
+# Mouseover tooltips. Keyed by elem_id; edit text here. Use "\n" for line breaks
+# (the title attribute renders them). "tt-lr" is set dynamically per optimizer in
+# the UI block. Applied to every matching component via make_init_tooltips_js().
+TOOLTIPS = {
+    # Action buttons
+    "btn-start": "Start training with\nthe current settings.",
+    "btn-stop": "Stop the current\ntraining process.",
+    "btn-refresh-picker": "Refresh the\nproject list.",
+    "btn-open": "Open the current project\nfolder in Explorer.",
+    "btn-save": "Save current settings.\nRenames the project folder\nif the name changed.",
+    # Left card — project
+    "tt-project-name": "Name of this project.\nUsed for the output folder\nand file names.",
+    "tt-trigger-word": "Trigger word automatically\nprepended to every caption\nand sample prompt.",
+    "tt-dataset-path": "Folder containing your\ntraining images and matching\n.txt caption files.",
+    "tt-project-picker": "Switch between existing\nprojects, or pick\n'➕ New Project' to create one.",
+    # Right card — training hyperparameters
+    "tt-rank": "LoRA network rank (dim).\nHigher = more capacity and\nlarger files.\nAlpha is set to rank / 2.",
+    "tt-optimizer": "Optimizer algorithm.\nPicking one fills in its\ndefault learning rate, warmup,\nand updates the Auto scheduler.",
+    "tt-lr": "Learning rate.",  # overwritten per-optimizer in the UI block
+    "tt-batch-size": "Images processed per step.\nHigher needs more VRAM.",
+    "tt-scheduler": "Learning-rate schedule.\n'Auto' uses the optimizer's\nrecommended default.\n'cosine_with_restarts' is the\noscillating wave (sine-like)\nschedule.",
+    "tt-warmup": "Warmup before the LR scheduler\nramps in, as % of total steps.\n\nProdigy: keep at 0 — warmup\nis handled internally via\nsafeguard_warmup.\nAdamW / CAME: 5% recommended.",
+    "tt-grad-acc": "Gradient accumulation steps.\nSimulates a larger batch\nwithout extra VRAM.",
+    "tt-steps": "Total training\nsteps to run.",
+    "tt-save-steps": "Save a checkpoint\nevery N steps.",
+    "tt-sample-steps": "Generate preview sample\nimages every N steps.",
+    "tt-dit": "Path to the DiT (anima)\nmodel file.\nSet once; shared\nacross projects.",
+    "tt-qwen": "Path to the Qwen3\ntext-encoder file.\nSet once; shared\nacross projects.",
+    "tt-vae": "Path to the VAE file.\nSet once; shared\nacross projects.",
+    # Sampling (preview generation) settings
+    "tt-neg-prompt": "Negative prompt applied\nto all preview samples.",
+    "tt-width": "Width of generated\npreview samples.",
+    "tt-height": "Height of generated\npreview samples.",
+    "tt-gen-steps": "Inference steps used when\ngenerating preview samples.",
+    "tt-gen-cfg": "Classifier-free guidance\n(CFG) scale for\npreview samples.",
+    "tt-gen-seed": "Seed for preview generation.\nSame seed = reproducible\npreviews.",
+}
+
+# Shared JS body that stamps the title attribute on a component's wrapper AND on
+# every inner control, so hovering either the label or the value field shows it.
+_JS_APPLY_TITLE = """
         const root = document.getElementById(id);
         if (!root) return;
-        const btn = root.querySelector("button") || root;
-        btn.setAttribute("title", tip);
+        root.setAttribute("title", tip);
+        root.querySelectorAll("button, input, textarea, select, .wrap, label").forEach(el => {
+            el.setAttribute("title", tip);
+        });
+"""
+
+def make_init_tooltips_js():
+    """Built at use-time so per-optimizer edits to TOOLTIPS['tt-lr'] are picked up."""
+    return ("""
+function() {
+    const tips = __TIPS__;
+    Object.entries(tips).forEach(([id, tip]) => {""" + _JS_APPLY_TITLE + """
     });
 }
-"""
+""").replace("__TIPS__", json.dumps(TOOLTIPS))
 
 
 LOG_BLACKLIST = [
@@ -117,6 +168,127 @@ LOG_BOX__MAX_LINES = 16
 GALLERY_HEIGHT = 440
 MAX_LOG_LINES = 500
 MAX_PROMPTS = 5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTIMIZER PROFILES — single source of truth for per-optimizer defaults.
+#
+# Edit values here to change what "Auto" resolves to. Every change propagates to
+# BOTH the generated training TOML (when scheduler/LR are left on Auto) AND the
+# "Auto (...)" labels shown in the UI. Nothing else needs to be touched.
+#
+#   lr             : default learning rate for this optimizer
+#   scheduler      : LR scheduler used when the UI scheduler is left on "Auto"
+#   optimizer_args : optimizer_args written into the training TOML
+# ─────────────────────────────────────────────────────────────────────────────
+OPTIMIZER_PROFILES = {
+    "Prodigy": {
+        "lr": "1.0",
+        "scheduler": "constant",
+        "warmup": 0,        # safeguard_warmup=True handles this internally
+        "optimizer_args": [
+            "decouple=True", "weight_decay=0.01", "d_coef=1",
+            "use_bias_correction=True", "safeguard_warmup=True", "betas=0.9,0.99",
+        ],
+    },
+    "AdamW8bit": {
+        "lr": "0.00005",
+        "scheduler": "cosine",
+        "warmup": 5,        # 5% of total steps; standard for cosine schedules
+        "optimizer_args": ["weight_decay=0.01"],
+    },
+    "AdamW": {
+        "lr": "0.00005",
+        "scheduler": "cosine",
+        "warmup": 5,
+        "optimizer_args": ["weight_decay=0.01"],
+    },
+    "CAME": {
+        "lr": "0.0002",
+        "scheduler": "cosine",
+        "warmup": 5,
+        "optimizer_args": ["weight_decay=0.01", "betas=0.9,0.999,0.9999"],
+    },
+}
+DEFAULT_OPTIMIZER = "Prodigy"
+OPTIMIZER_CHOICES = list(OPTIMIZER_PROFILES.keys())
+
+# Sentinel stored when scheduler is left on "Auto" (resolved at TOML-write time).
+AUTO_SENTINEL = "auto"
+
+# Schedulers selectable in the UI (besides the Auto entry). These are the names
+# sd-scripts' get_scheduler_fix() understands. "cosine_with_restarts" is the
+# oscillating / wave ("sine-like") schedule — pair it with warmup as desired.
+SCHEDULER_CHOICES = [
+    "constant",
+    "constant_with_warmup",
+    "linear",
+    "cosine",
+    "cosine_with_restarts",
+    "polynomial",
+]
+
+# Global default warmup (percentage of total steps, 0 = no warmup).
+DEFAULT_LR_WARMUP_STEPS = 0
+
+
+def optimizer_default_lr(opt):
+    return OPTIMIZER_PROFILES.get(opt, {}).get("lr", "1.0")
+
+def optimizer_default_scheduler(opt):
+    return OPTIMIZER_PROFILES.get(opt, {}).get("scheduler", "cosine")
+
+def optimizer_default_warmup(opt):
+    return OPTIMIZER_PROFILES.get(opt, {}).get("warmup", 5)
+
+def optimizer_args_for(opt):
+    return list(OPTIMIZER_PROFILES.get(opt, {}).get("optimizer_args", ["weight_decay=0.01"]))
+
+def resolve_scheduler(scheduler_setting, optimizer):
+    """Map the UI scheduler value to a concrete scheduler name.
+    An empty value or the Auto sentinel resolves to the optimizer's profile default."""
+    if not scheduler_setting or scheduler_setting == AUTO_SENTINEL:
+        return optimizer_default_scheduler(optimizer)
+    return scheduler_setting
+
+def parse_warmup(value):
+    """Warmup is a percentage (0–100). Converts to a ratio for the training TOML."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if f <= 0:
+        return 0
+    return round(f / 100, 6)
+
+def scheduler_dropdown_choices(opt):
+    """(label, value) pairs for the scheduler dropdown, with a live Auto label."""
+    return [(f"Auto ({optimizer_default_scheduler(opt)})", AUTO_SENTINEL)] + [(s, s) for s in SCHEDULER_CHOICES]
+
+def lr_tooltip(opt):
+    """Per-optimizer learning-rate tooltip (multi-line). The LR is a free numeric
+    field (not a dropdown), so its recommended default is surfaced here."""
+    return (
+        "Learning rate.\n"
+        f"Recommended for {opt}: {optimizer_default_lr(opt)}.\n"
+        "Switching optimizer fills in\nits recommended value."
+    )
+
+# JS that re-stamps the LR field's tooltip when the optimizer changes. Fires on
+# .change(), so it also covers programmatic changes from loading a project.
+JS_LR_TOOLTIP = ("""
+(opt) => {
+    const map = __LRMAP__;
+    const tip = map[opt];
+    if (tip === undefined) return [];
+    const root = document.getElementById("tt-lr");
+    if (root) {
+        root.setAttribute("title", tip);
+        root.querySelectorAll("input, textarea, label, .wrap").forEach(el => el.setAttribute("title", tip));
+    }
+    return [];
+}
+""").replace("__LRMAP__", json.dumps({o: lr_tooltip(o) for o in OPTIMIZER_CHOICES}))
 
 
 ROOT = Path(__file__).resolve().parent
@@ -145,6 +317,8 @@ DEFAULT_SETTINGS = {
     "network_rank": 32,
     "learning_rate": "1.0", # Prodigy default
     "optimizer": "Prodigy", # Prodigy default
+    "lr_scheduler": "auto", # "auto" => use the optimizer profile's default scheduler
+    "lr_warmup_steps": 0,   # percentage of total steps (0 = no warmup)
     "training_steps": 2400,
     "save_steps": 300,
     "sample_steps": 300,
@@ -194,7 +368,7 @@ def write_project_configs(settings_dict):
     base_res, max_bucket = analyze_dataset_resolution(dataset_path)
     prompt_path = create_sample_prompts(project_name_clean, settings_dict.get("trigger_word", ""), pos_prompts, settings_dict.get("neg_prompt", ""), settings_dict.get("width", 1024), settings_dict.get("height", 1024), settings_dict.get("sample_steps_gen", 30), settings_dict.get("sample_cfg", 4.0), settings_dict.get("sample_seed", 42), project_configs_dir)
     create_dataset_toml(project_name_clean, dataset_path, settings_dict.get("trigger_word", ""), base_res, max_bucket, project_configs_dir)
-    create_training_toml(project_name_clean, project_configs_dir, project_out_dir, settings_dict.get("network_rank", 32), settings_dict.get("learning_rate", "1.0"), settings_dict.get("optimizer", "Prodigy"), settings_dict.get("training_steps", 2400), settings_dict.get("save_steps", 300), settings_dict.get("sample_steps", 300), models, prompt_path, settings_dict.get("train_seed", 42), settings_dict.get("train_batch_size", 1), settings_dict.get("gradient_accumulation_steps", 1))
+    create_training_toml(project_name_clean, project_configs_dir, project_out_dir, settings_dict.get("network_rank", 32), settings_dict.get("learning_rate", "1.0"), settings_dict.get("optimizer", "Prodigy"), settings_dict.get("training_steps", 2400), settings_dict.get("save_steps", 300), settings_dict.get("sample_steps", 300), models, prompt_path, settings_dict.get("train_seed", 42), settings_dict.get("train_batch_size", 1), settings_dict.get("gradient_accumulation_steps", 1), settings_dict.get("lr_scheduler", "auto"), settings_dict.get("lr_warmup_steps", 0))
 
 def _rename_prefixed_files(directory, old_prefix, new_prefix):
     """Rename all files/dirs inside `directory` whose names start with `old_prefix`."""
@@ -279,6 +453,16 @@ def save_state(picker_value, folder_tracker, *args):
 
 def settings_to_values(settings_dict):
     return [settings_dict.get(k, DEFAULT_SETTINGS[k]) for k in SETTINGS_KEYS]
+
+def decorate_auto_displays(values):
+    """Patch the scheduler entry in a settings_to_values() list so its Auto label
+    reflects the (programmatically) loaded optimizer. The .input() handlers only
+    fire on real user interaction, so loads need this."""
+    vals = list(values)
+    opt = vals[SETTINGS_KEYS.index("optimizer")]
+    si = SETTINGS_KEYS.index("lr_scheduler")
+    vals[si] = gr.update(choices=scheduler_dropdown_choices(opt), value=vals[si])
+    return vals
 
 def get_prompt_count(settings_dict):
     count = 1
@@ -379,12 +563,24 @@ def load_project_config(project_input):
         .get("subsets", [{}])[0]
         .get("image_dir", loaded["dataset_path"])
     )
-    loaded["dit_path"] = training_cfg.get("pretrained_model_name_or_path", loaded["dit_path"])
-    loaded["qwen_path"] = training_cfg.get("qwen3", loaded["qwen_path"])
-    loaded["vae_path"] = training_cfg.get("vae", loaded["vae_path"])
+    # Model paths are global/shared (from settings.json), not per-project.
+    # Intentionally do NOT load them from the project TOML so switching projects
+    # keeps the globally configured model paths.
     loaded["network_rank"] = int(training_cfg.get("network_dim", loaded["network_rank"]))
     loaded["learning_rate"] = str(training_cfg.get("learning_rate", loaded["learning_rate"]))
-    loaded["optimizer"] = training_cfg.get("optimizer_type", loaded["optimizer"])
+    # Reverse-map dotted optimizer_type paths (e.g. pytorch_optimizer.CAME) back to friendly dropdown names.
+    OPTIMIZER_TYPE_REVERSE_MAP = {"pytorch_optimizer.CAME": "CAME"}
+    loaded_opt = training_cfg.get("optimizer_type", loaded["optimizer"])
+    loaded["optimizer"] = OPTIMIZER_TYPE_REVERSE_MAP.get(loaded_opt, loaded_opt)
+    # Scheduler: if the saved value matches what "Auto" would pick for this optimizer,
+    # show it as Auto (so changing the profile default keeps the display in sync).
+    loaded_sched = training_cfg.get("lr_scheduler", AUTO_SENTINEL)
+    loaded["lr_scheduler"] = AUTO_SENTINEL if loaded_sched == optimizer_default_scheduler(loaded["optimizer"]) else loaded_sched
+    raw_warmup = training_cfg.get("lr_warmup_steps", loaded["lr_warmup_steps"])
+    if isinstance(raw_warmup, float) and 0 < raw_warmup < 1:
+        loaded["lr_warmup_steps"] = int(round(raw_warmup * 100))
+    else:
+        loaded["lr_warmup_steps"] = int(raw_warmup) if raw_warmup else 0
     loaded["training_steps"] = int(training_cfg.get("max_train_steps", loaded["training_steps"]))
     loaded["save_steps"] = int(training_cfg.get("save_every_n_steps", loaded["save_steps"]))
     loaded["sample_steps"] = int(training_cfg.get("sample_every_n_steps", loaded["sample_steps"]))
@@ -522,16 +718,20 @@ def create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_
     with open(config_path, "w", encoding="utf-8") as f: toml.dump(dataset_config, f)
     return str(config_path)
 
-def create_training_toml(project_name, config_save_dir, actual_output_dir, rank, lr, optimizer, max_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc):
+def create_training_toml(project_name, config_save_dir, actual_output_dir, rank, lr, optimizer, max_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc, lr_scheduler="auto", lr_warmup_steps=0):
     config_path = config_save_dir / f"{project_name}_training.toml"
     network_alpha = max(1, int(rank) // 2)
-    
-    opt_args = ["weight_decay=0.01"]
-    if optimizer == "Prodigy":
-        scheduler = "constant"
-        opt_args = ["decouple=True", "weight_decay=0.01", "d_coef=1", "use_bias_correction=True", "safeguard_warmup=True", "betas=0.9,0.99"]
-    else:
-        scheduler = "cosine"
+
+    # Map friendly optimizer names to the actual optimizer_type written to the TOML.
+    # sd-scripts imports any dotted "module.Class" path; CAME comes from pytorch_optimizer.
+    OPTIMIZER_TYPE_MAP = {"CAME": "pytorch_optimizer.CAME"}
+    optimizer_type_value = OPTIMIZER_TYPE_MAP.get(optimizer, optimizer)
+
+    # Scheduler + optimizer args come from the centralized OPTIMIZER_PROFILES.
+    # When the UI leaves the scheduler on "Auto", resolve to the profile default.
+    opt_args = optimizer_args_for(optimizer)
+    scheduler = resolve_scheduler(lr_scheduler, optimizer)
+    warmup = parse_warmup(lr_warmup_steps)
 
     training_config = {
         "pretrained_model_name_or_path": Path(models["dit_path"]).resolve().as_posix(),
@@ -543,9 +743,10 @@ def create_training_toml(project_name, config_save_dir, actual_output_dir, rank,
         "network_train_unet_only": HIDDEN_SETTINGS["network_train_unet_only"],
         "gradient_checkpointing": HIDDEN_SETTINGS["gradient_checkpointing"],
         "learning_rate": float(lr),
-        "optimizer_type": optimizer,
+        "optimizer_type": optimizer_type_value,
         "optimizer_args": opt_args,
         "lr_scheduler": scheduler,
+        "lr_warmup_steps": warmup,
         "max_train_steps": int(max_steps),
         "train_batch_size": int(batch_size),
         "gradient_accumulation_steps": int(grad_acc),
@@ -612,7 +813,7 @@ def get_latest_state_dir(project_out_dir, project_name):
             latest_state = state_dir
     return latest_state, max(0, latest_step)
 
-def start_training(trigger_word, project_name, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, pos2, pos3, pos4, pos5, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc):
+def start_training(trigger_word, project_name, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, lr_scheduler, lr_warmup_steps, t_steps, save_steps, sample_steps, pos, pos2, pos3, pos4, pos5, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc):
     global training_process
 
      # --- PATH VALIDATION BLOCK ---
@@ -636,7 +837,7 @@ def start_training(trigger_word, project_name, dataset_path, dit_p, qwen_p, vae_
 
     if error_messages:
         full_error = "\n".join(error_messages)
-        full_error += "\n\n⚠️ ERROR: Please check and set the correct model paths in the section:\n'🔧 Paths to Models <- Set Once'"
+        full_error += "\n\n⚠️ ERROR: Please check and set the correct model paths in the section:\n'🔧 Paths to Models'"
         yield full_error, gr.update()
         return
     # --- END VALIDATION BLOCK ---
@@ -677,8 +878,10 @@ def start_training(trigger_word, project_name, dataset_path, dit_p, qwen_p, vae_
     latest_ckpt, ckpt_steps = get_latest_checkpoint(project_out_dir, project_name)
     latest_state_dir, state_steps = get_latest_state_dir(project_out_dir, project_name)
     completed_steps = max(ckpt_steps, state_steps)
-    
-    yield "\n".join(log_lines), gr.update()
+
+    # Show any existing samples immediately so the gallery isn't blank until the
+    # first new preview lands.
+    yield "\n".join(log_lines), get_latest_images(sample_dir)
 
     if completed_steps > 0:
         if completed_steps >= max_steps:
@@ -699,7 +902,7 @@ def start_training(trigger_word, project_name, dataset_path, dit_p, qwen_p, vae_
     models = {"dit_path": dit_p, "qwen_path": qwen_p, "vae_path": vae_p}
     prompt_path = create_sample_prompts(project_name, trigger_word, [pos, pos2, pos3, pos4, pos5], neg, w, h, s_steps_gen, s_cfg, s_seed, project_configs_dir)
     dataset_toml = create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_bucket, project_configs_dir)
-    training_toml = create_training_toml(project_name, project_configs_dir, project_out_dir, rank, lr, optimizer, t_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc)
+    training_toml = create_training_toml(project_name, project_configs_dir, project_out_dir, rank, lr, optimizer, t_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc, lr_scheduler, lr_warmup_steps)
 
     launch_errors = []
     if not TRAIN_PYTHON.exists():
@@ -844,9 +1047,22 @@ def stop_training():
             return f"⚠️ Error during stop: {str(e)}"
     return "ℹ️ Not running."
 
-def handle_optimizer_change(opt, current_lr, saved_adam_lr):
-    if opt == "Prodigy": return "1.0", current_lr
-    return (saved_adam_lr if current_lr == "1.0" else current_lr), saved_adam_lr
+def remember_lr(opt, current_lr, lr_memory):
+    """Remember the current LR under the currently selected optimizer (user typing)."""
+    lr_memory = dict(lr_memory or {})
+    if opt:
+        lr_memory[opt] = current_lr
+    return lr_memory
+
+def apply_optimizer_lr(opt, current_lr, lr_memory):
+    """When the user switches optimizer, restore its remembered LR or fall back to its
+    profile default (see OPTIMIZER_PROFILES)."""
+    lr_memory = lr_memory or {}
+    return lr_memory.get(opt) or optimizer_default_lr(opt)
+
+def apply_optimizer_warmup(opt):
+    """When the user switches optimizer, update warmup to the profile's recommended default."""
+    return optimizer_default_warmup(opt)
 
 
 def _unique_project_name(base_name):
@@ -919,26 +1135,36 @@ with gr.Blocks(title="Anima TrainFlow") as ui:
         elem_id="main-header"
     )
     
-    saved_adam_lr = gr.State(value="0.00005")
+    # Per-optimizer LR memory, seeded with defaults plus the currently loaded optimizer's saved LR.
+    lr_memory_state = gr.State(value={**{o: optimizer_default_lr(o) for o in OPTIMIZER_CHOICES}, cs.get("optimizer", DEFAULT_OPTIMIZER): cs.get("learning_rate", "1.0")})
     prompt_count_state = gr.Number(value=get_prompt_count(cs), visible=False, precision=0)
     # Tracks the actual on-disk folder name of the currently loaded project.
     # Updated by every "project loaded" event. Never touched by the user typing in project_name.
     _folder_tracker = gr.Textbox(visible=False, value=cs.get("project_name", ""))
 
-    with gr.Group():
-        with gr.Row():
-            with gr.Column(scale=1):
+    cur_opt = cs.get("optimizer", DEFAULT_OPTIMIZER)
+    TOOLTIPS["tt-lr"] = lr_tooltip(cur_opt)  # initial LR tooltip for the loaded optimizer
+    with gr.Row():
+        # ── LEFT: project / actions / logs ────────────────────────────────────
+        with gr.Column(scale=1):
+            with gr.Group():
                 with gr.Row():
-                    project_name = gr.Textbox(label="Project Name", value=cs.get("project_name", ""), placeholder="e.g., anima_character_v1", lines=1, max_lines=1)
-                    trigger_word = gr.Textbox(label="Trigger Word", value=cs.get("trigger_word", ""), placeholder="e.g., unique_style", lines=1, max_lines=1)
+                    project_name = gr.Textbox(label="Project Name", value=cs.get("project_name", ""), placeholder="e.g., anima_character_v1", lines=1, max_lines=1, elem_id="tt-project-name")
+                    trigger_word = gr.Textbox(label="Trigger Word", value=cs.get("trigger_word", ""), placeholder="e.g., unique_style", lines=1, max_lines=1, elem_id="tt-trigger-word")
                 with gr.Row():
-                    dataset_path = gr.Textbox(label="Dataset Path (Images + .txt)", value=cs.get("dataset_path", ""), placeholder="C:/Images/MyDataset", lines=1, max_lines=1)
+                    dataset_path = gr.Textbox(label="Dataset Path (Images + .txt)", value=cs.get("dataset_path", ""), placeholder="C:/Images/MyDataset", lines=1, max_lines=1, elem_id="tt-dataset-path")
                     project_picker = gr.Dropdown(
                         label="Project Picker",
                         choices=[NEW_PROJECT_SENTINEL] + list_output_projects(),
                         value=cs.get("project_name", None),
                         allow_custom_value=True,
+                        elem_id="tt-project-picker",
                     )
+            with gr.Accordion("🔧 Paths to Models", open=False):
+                dit_input = gr.Textbox(label="DiT", value=cs.get("dit_path", ""), lines=1, max_lines=1, elem_id="tt-dit")
+                qwen_input = gr.Textbox(label="Qwen3", value=cs.get("qwen_path", ""), lines=1, max_lines=1, elem_id="tt-qwen")
+                vae_input = gr.Textbox(label="VAE", value=cs.get("vae_path", ""), lines=1, max_lines=1, elem_id="tt-vae")
+            with gr.Group():
                 with gr.Row():
                     start_btn = gr.Button("🚀 Start", variant="primary", scale=1, min_width=0, elem_id="btn-start")
                     stop_btn = gr.Button("🛑 Stop", variant="stop", scale=1, min_width=0, elem_id="btn-stop")
@@ -953,27 +1179,24 @@ with gr.Blocks(title="Anima TrainFlow") as ui:
                     with gr.Row():
                         modal_confirm_btn = gr.Button("✅ Create", variant="primary", scale=1, min_width=0)
                         modal_cancel_btn = gr.Button("❌ Cancel", scale=1, min_width=0)
-            with gr.Column(scale=1):
-                with gr.Row():
-                    rank_input = gr.Number(label="Network Rank", value=cs.get("network_rank", 16), precision=0)
-                    lr_input = gr.Textbox(label="Learning Rate", value=cs.get("learning_rate", "1.0"))
-                    optimizer_input = gr.Dropdown(label="Optimizer", choices=["Prodigy", "AdamW8bit", "AdamW"], value=cs.get("optimizer", "Prodigy"))
-                    train_seed_val = gr.Number(value=cs.get("train_seed", 42), visible=False)
-                    batch_size_input = gr.Number(label="Batch Size", value=cs.get("train_batch_size", 1), precision=0)
-                with gr.Row():
-                    steps_input = gr.Number(label="Max Training Steps", value=cs.get("training_steps", 2400), precision=0)
-                    save_steps_input = gr.Number(label="Save x Steps", value=cs.get("save_steps", 300), precision=0)
-                    sample_steps_input = gr.Number(label="Preview x Steps", value=cs.get("sample_steps", 300), precision=0)
-                    grad_acc_input = gr.Number(label="Gradient Accum.", value=cs.get("gradient_accumulation_steps", 1), precision=0)
-                with gr.Accordion("🔧 Paths to Models <- Set Once", open=False):
-                    dit_input = gr.Textbox(label="DiT", value=cs.get("dit_path", ""), lines=1, max_lines=1)
-                    qwen_input = gr.Textbox(label="Qwen3", value=cs.get("qwen_path", ""), lines=1, max_lines=1)
-                    vae_input = gr.Textbox(label="VAE", value=cs.get("vae_path", ""), lines=1, max_lines=1)
-
-    with gr.Row():
-        with gr.Column(scale=1):
             output_log = gr.Textbox(label="Logs", lines=LOG_BOX__MAX_LINES, max_lines=LOG_BOX__MAX_LINES, interactive=False, autoscroll=True, elem_id="log-container")
+        # ── RIGHT: training hyperparameters + sample gallery ──────────────────
         with gr.Column(scale=1):
+            with gr.Group():
+                with gr.Row():
+                    rank_input = gr.Number(label="Network Rank", value=cs.get("network_rank", 16), precision=0, elem_id="tt-rank")
+                    optimizer_input = gr.Dropdown(label="Optimizer", choices=OPTIMIZER_CHOICES, value=cur_opt, elem_id="tt-optimizer")
+                    lr_input = gr.Textbox(label="Learning Rate", value=cs.get("learning_rate", "1.0"), elem_id="tt-lr")
+                    batch_size_input = gr.Number(label="Batch Size", value=cs.get("train_batch_size", 1), precision=0, elem_id="tt-batch-size")
+                    train_seed_val = gr.Number(value=cs.get("train_seed", 42), visible=False)
+                with gr.Row():
+                    scheduler_input = gr.Dropdown(label="LR Scheduler", choices=scheduler_dropdown_choices(cur_opt), value=cs.get("lr_scheduler", AUTO_SENTINEL), elem_id="tt-scheduler")
+                    warmup_input = gr.Number(label="Warmup Steps %", value=cs.get("lr_warmup_steps", optimizer_default_warmup(cur_opt)), precision=0, elem_id="tt-warmup")
+                    grad_acc_input = gr.Number(label="Gradient Accum.", value=cs.get("gradient_accumulation_steps", 1), precision=0, elem_id="tt-grad-acc")
+                with gr.Row():
+                    steps_input = gr.Number(label="Max Training Steps", value=cs.get("training_steps", 2400), precision=0, elem_id="tt-steps")
+                    save_steps_input = gr.Number(label="Save x Steps", value=cs.get("save_steps", 300), precision=0, elem_id="tt-save-steps")
+                    sample_steps_input = gr.Number(label="Preview x Steps", value=cs.get("sample_steps", 300), precision=0, elem_id="tt-sample-steps")
             with gr.Accordion("🖼️ Sample Gallery", open=True):
                 preview_gallery = gr.Gallery(label="Previews", columns=2, rows=2, height=GALLERY_HEIGHT, object_fit="contain", show_label=False)
             with gr.Group():
@@ -995,17 +1218,17 @@ with gr.Blocks(title="Anima TrainFlow") as ui:
                 pos_prompt_3 = gr.Textbox(label="Prompt 3", lines=2, value=cs.get("pos_prompt_3", ""), visible=get_prompt_count(cs) >= 3)
                 pos_prompt_4 = gr.Textbox(label="Prompt 4", lines=2, value=cs.get("pos_prompt_4", ""), visible=get_prompt_count(cs) >= 4)
                 pos_prompt_5 = gr.Textbox(label="Prompt 5", lines=2, value=cs.get("pos_prompt_5", ""), visible=get_prompt_count(cs) >= 5)
-                neg_prompt = gr.Textbox(label="Negative Prompt", lines=1, value=cs.get("neg_prompt", ""))
+                neg_prompt = gr.Textbox(label="Negative Prompt", lines=1, value=cs.get("neg_prompt", ""), elem_id="tt-neg-prompt")
                 with gr.Row():
-                    width_input = gr.Number(label="Width", value=cs.get("width", 1024), precision=0, min_width=80)
-                    height_input = gr.Number(label="Height", value=cs.get("height", 1024), precision=0, min_width=80)
-                    sample_steps_gen_input = gr.Number(label="Steps", value=cs.get("sample_steps_gen", 30), precision=0, min_width=80)
-                    sample_cfg_input = gr.Number(label="CFG", value=cs.get("sample_cfg", 4.0), min_width=80)
-                    sample_seed_input = gr.Number(label="Seed", value=cs.get("sample_seed", 42), precision=0, min_width=80)
+                    width_input = gr.Number(label="Width", value=cs.get("width", 1024), precision=0, min_width=80, elem_id="tt-width")
+                    height_input = gr.Number(label="Height", value=cs.get("height", 1024), precision=0, min_width=80, elem_id="tt-height")
+                    sample_steps_gen_input = gr.Number(label="Steps", value=cs.get("sample_steps_gen", 30), precision=0, min_width=80, elem_id="tt-gen-steps")
+                    sample_cfg_input = gr.Number(label="CFG", value=cs.get("sample_cfg", 4.0), min_width=80, elem_id="tt-gen-cfg")
+                    sample_seed_input = gr.Number(label="Seed", value=cs.get("sample_seed", 42), precision=0, min_width=80, elem_id="tt-gen-seed")
 
     inputs_list = [
         trigger_word, project_name, dataset_path, dit_input, qwen_input, vae_input,
-        rank_input, lr_input, optimizer_input, 
+        rank_input, lr_input, optimizer_input, scheduler_input, warmup_input,
         steps_input, save_steps_input, sample_steps_input,
         pos_prompt, pos_prompt_2, pos_prompt_3, pos_prompt_4, pos_prompt_5, neg_prompt, width_input, height_input,
         sample_steps_gen_input, sample_cfg_input, sample_seed_input, train_seed_val, batch_size_input, grad_acc_input
@@ -1013,12 +1236,32 @@ with gr.Blocks(title="Anima TrainFlow") as ui:
 
     def load_state_on_refresh():
         current_settings = load_settings()
-        return settings_to_values(current_settings) + [current_settings.get("project_name", "")]
+        project_name_val = current_settings.get("project_name", "")
+        sample_dir = OUTPUT_BASE / project_name_val / "sample" if project_name_val else Path("nonexistent")
+        images = get_latest_images(sample_dir) if sample_dir.exists() else []
+        return decorate_auto_displays(settings_to_values(current_settings)) + [images, project_name_val]
 
-    ui.load(fn=load_state_on_refresh, inputs=None, outputs=inputs_list + [_folder_tracker], js=JS_INIT_TOOLTIPS)    
+    ui.load(fn=load_state_on_refresh, inputs=None, outputs=inputs_list + [preview_gallery, _folder_tracker], js=make_init_tooltips_js())    
 
     output_log.change(None, None, None, js=JS_SCROLL)
-    optimizer_input.change(fn=handle_optimizer_change, inputs=[optimizer_input, lr_input, saved_adam_lr], outputs=[lr_input, saved_adam_lr])
+    # .input() fires only on real user interaction (not on programmatic project loads),
+    # so loading a project never clobbers its saved LR.
+    lr_input.input(fn=remember_lr, inputs=[optimizer_input, lr_input, lr_memory_state], outputs=[lr_memory_state])
+    optimizer_input.input(fn=apply_optimizer_lr, inputs=[optimizer_input, lr_input, lr_memory_state], outputs=[lr_input])
+    optimizer_input.input(fn=apply_optimizer_warmup, inputs=[optimizer_input], outputs=[warmup_input])
+
+    def relabel_scheduler_auto(opt, current_value):
+        choices = scheduler_dropdown_choices(opt)
+        valid = {c[1] for c in choices}
+        val = current_value if current_value in valid else AUTO_SENTINEL
+        return gr.update(choices=choices, value=val)
+
+    # Keep the "Auto (...)" scheduler label in sync with the selected optimizer,
+    # reading live from OPTIMIZER_PROFILES.
+    optimizer_input.input(fn=relabel_scheduler_auto, inputs=[optimizer_input, scheduler_input], outputs=[scheduler_input])
+    # Re-stamp the LR field's tooltip for the new optimizer (fires on user picks
+    # and on programmatic project loads).
+    optimizer_input.change(fn=None, inputs=[optimizer_input], outputs=None, js=JS_LR_TOOLTIP)
 
     def maybe_load_project(val):
         if val == NEW_PROJECT_SENTINEL:
@@ -1027,6 +1270,8 @@ with gr.Blocks(title="Anima TrainFlow") as ui:
         # result = settings_to_values + [images, log_msg]
         # Extract the sanitized folder name from the loaded project_name value
         folder_name = result[SETTINGS_KEYS.index("project_name")]
+        n = len(SETTINGS_KEYS)
+        result = decorate_auto_displays(result[:n]) + result[n:]
         return result + [folder_name]
 
     def cancel_modal():
@@ -1050,7 +1295,7 @@ with gr.Blocks(title="Anima TrainFlow") as ui:
         for d in [project_out_dir, project_out_dir / "configs", project_out_dir / "sample"]:
             d.mkdir(parents=True, exist_ok=True)
         choices = [NEW_PROJECT_SENTINEL] + list_output_projects()
-        new_vals = settings_to_values(new_settings)
+        new_vals = decorate_auto_displays(settings_to_values(new_settings))
         count = get_prompt_count(new_settings)
         msg = f"✅ {'Cloned to' if modal_type == 'Clone Current' else 'New project created'}: {new_name_clean}"
         return (
